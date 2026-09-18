@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"os"
 	"runtime"
@@ -13,21 +14,28 @@ import (
 
 // worker is our independent clone. We spin up one of these for every CPU core.
 func worker(workerID int, jobs <-chan string, results chan<- int, filterKeyword string, wg *sync.WaitGroup) {
-	// 1. wg.Done() checks this worker off the roll-call sheet when it finishes and dies.
 	defer wg.Done()
-
-	// 2. This is totally private to this specific clone. No other worker can see or touch it.
 	localMatchCount := 0
 
-	// 3. Pull lines off the conveyor belt until the main thread closes it.
-	for line := range jobs {
-		if filterKeyword == "" || strings.Contains(line, filterKeyword) {
-			localMatchCount++ // Silently tally
+	for chunk := range jobs {
+		for len(chunk) > 0 {
+			newlineIndex := bytes.IndexByte(chunk, '\n');
+
+			var line []byte
+			if newlineIndex == -1 {
+				line = chunk;
+				chunk = nil;
+			} else {
+				line = chunk[:newlineIndex];
+				chunk = chunk[newlineIndex + 1:]
+			}
+
+			if len(filterKeyword) == 0 || bytes.Contains(line, filterKeyword) {
+				localMatchCount++
+			}
 		}
 	}
 
-	// 4. The jobs channel closed. We are done! 
-	// Drop our final tally into the results bucket.
 	results <- localMatchCount
 }
 
