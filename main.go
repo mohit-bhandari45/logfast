@@ -64,7 +64,12 @@ func main() {
 			// If it gets full, the main thread pauses reading the file until workers catch up.
 			jobs := make(chan string, 1000)
 
-			// The Results Bucket: Exactly one slot for every worker. 
+			// Why not just use a shared 'var totalCount int' for all workers?
+			// Because if 10 workers try to do totalCount++ at the exact same microsecond, 
+			// they overwrite each other (a Race Condition). To fix that, we'd need a Mutex lock, 
+			// which forces workers to wait in line, destroying our speed!
+			// 
+			// Instead, we use a Results Bucket. Exactly one slot for every worker. 
 			// It is mathematically impossible for this to get full and block a worker.
 			results := make(chan int, numWorkers)
 
