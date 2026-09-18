@@ -1,35 +1,41 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
-	"strings"
 	"sync"
 
 	"github.com/spf13/cobra"
 )
 
-// worker is our independent clone. We spin up one of these for every CPU core.
-func worker(workerID int, jobs <-chan string, results chan<- int, filterKeyword string, wg *sync.WaitGroup) {
+func worker(workerID int, jobs <-chan []byte, results chan<- int, filterKeyword []byte, wg *sync.WaitGroup) {
 	defer wg.Done()
+
 	localMatchCount := 0
 
 	for chunk := range jobs {
+		// Keep slicing the chunk until there is no data left
 		for len(chunk) > 0 {
-			newlineIndex := bytes.IndexByte(chunk, '\n');
-
+			// Find the location of the next line break
+			newlineIndex := bytes.IndexByte(chunk, '\n')
+			
 			var line []byte
 			if newlineIndex == -1 {
-				line = chunk;
-				chunk = nil;
+				// No line break means this is the very last piece of text in the chunk
+				line = chunk
+				// Empty the chunk to stop the loop
+				chunk = nil
 			} else {
-				line = chunk[:newlineIndex];
-				chunk = chunk[newlineIndex + 1:]
+				// Slice out the exact line using zero-copy memory pointers
+				line = chunk[:newlineIndex]
+				// Shrink the remaining chunk by moving past the line break we just found
+				chunk = chunk[newlineIndex+1:]
 			}
 
+			// Check if the line contains our keyword directly in the raw bytes
 			if len(filterKeyword) == 0 || bytes.Contains(line, filterKeyword) {
 				localMatchCount++
 			}
@@ -63,65 +69,84 @@ func main() {
 			}
 			defer file.Close()
 
-			// --- CONCURRENCY ARCHITECTURE ---
-
 			numWorkers := runtime.NumCPU()
 			fmt.Printf("Starting %d workers...\n", numWorkers)
 
-			// The Jobs Bucket: Holds up to 1000 lines. 
-			// If it gets full, the main thread pauses reading the file until workers catch up.
-			jobs := make(chan string, 1000)
+			// Convert the string keyword to bytes once so workers don't have to
+			filterBytes := []byte(filterKeyword)
 
-			// Why not just use a shared 'var totalCount int' for all workers?
-			// Because if 10 workers try to do totalCount++ at the exact same microsecond, 
-			// they overwrite each other (a Race Condition). To fix that, we'd need a Mutex lock, 
-			// which forces workers to wait in line, destroying our speed!
-			// 
-			// Instead, we use a Results Bucket. Exactly one slot for every worker. 
-			// It is mathematically impossible for this to get full and block a worker.
+			// Update the jobs channel to hold blocks of raw bytes
+			jobs := make(chan []byte, 100)
 			results := make(chan int, numWorkers)
-
 			var wg sync.WaitGroup
 
-			// FAN-OUT: Spawn the independent worker clones
 			for i := 0; i < numWorkers; i++ {
 				wg.Add(1)
-				go worker(i, jobs, results, filterKeyword, &wg)
+				go worker(i, jobs, results, filterBytes, &wg)
 			}
 
-			scanner := bufio.NewScanner(file)
-			totalLines := 0
+			// Create a 64KB bucket to scoop data from the hard drive
+			buf := make([]byte, 64*1024)
+			// This cup holds words that get accidentally chopped in half
+			var tail []byte
 
-			// The main thread's ONLY job is reading the disk and feeding the workers
-			for scanner.Scan() {
-				totalLines++
-				jobs <- scanner.Text()
+			for {
+				// Scoop up to 64KB of data from the file
+				n, err := file.Read(buf)
+				
+				if n > 0 {
+					// Glue the chopped word from the previous scoop to the front of this new scoop
+					chunk := append(tail, buf[:n]...)
+
+					// Scan backwards to find the last clean line break
+					lastNewline := bytes.LastIndexByte(chunk, '\n')
+					
+					if lastNewline != -1 {
+						// Create a fresh, safe memory box for the clean lines
+						// We must make a copy so the next file read doesn't overwrite these bytes
+						sendChunk := make([]byte, lastNewline+1)
+						copy(sendChunk, chunk[:lastNewline+1])
+						
+						// Ship the clean lines to the workers
+						jobs <- sendChunk
+						
+						// Save the remaining chopped-off word into the tail cup for the next loop
+						tail = chunk[lastNewline+1:]
+					} else {
+						// The entire chunk had no line breaks, so it's all one giant tail
+						tail = chunk
+					}
+				}
+
+				// Check if we hit the bottom of the file
+				if err == io.EOF {
+					// If there is any leftover chopped text, send it to the workers
+					if len(tail) > 0 {
+						jobs <- tail
+					}
+					// Exit the infinite loop
+					break
+				}
+				if err != nil {
+					fmt.Printf("Error reading file: %v\n", err)
+					os.Exit(1)
+				}
 			}
 
-			if err := scanner.Err(); err != nil {
-				fmt.Printf("Error reading file: %v\n", err)
-				os.Exit(1)
-			}
-
-			// We hit the bottom of the file. Put up the "Closed" sign on the jobs bucket.
+			// Put up the closed sign on the jobs channel
 			close(jobs)
 
-			// Our background guard. It waits for all workers to finish, 
-			// then puts a padlock on the results bucket so the main thread knows when to stop waiting.
 			go func() {
 				wg.Wait()
 				close(results)
 			}()
 
-			// FAN-IN: Reach into the results bucket, pull out the numbers, and add them up.
-			// This loop automatically breaks when it feels the padlock (close(results)).
 			totalMatches := 0
 			for count := range results {
 				totalMatches += count
 			}
 
 			fmt.Printf("\n--- Analysis Complete ---\n")
-			fmt.Printf("Total lines processed: %d\n", totalLines)
 			fmt.Printf("Total matches found: %d\n", totalMatches)
 		},
 	}
