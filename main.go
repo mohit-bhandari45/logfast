@@ -1,24 +1,24 @@
 package main
 
 import (
-	"bufio" // New! For scanning the file
+	"bufio"
 	"fmt"
 	"os"
-	"strings" // New! For searching text
+	"strings"
 
 	"github.com/spf13/cobra"
 )
 
 func main() {
-	var filePath = ""
+	var filePath string
 	var filterKeyword string
 
 	var rootCmd = &cobra.Command{
 		Use:   "logfast",
 		Short: "A high-throughput log stream analyzer",
-		Long:  `logfast is a blazing fast CLI tool to ingest, parse, and analyze massive log files in real-time.`,
-
+		
 		Run: func(cmd *cobra.Command, args []string) {
+			// Stop the program if the user forgot to pass a file path
 			if filePath == "" {
 				fmt.Println("Error: You must provide a log file path using the --file flag.")
 				cmd.Usage()
@@ -27,26 +27,36 @@ func main() {
 
 			fmt.Printf("Analyzing file: %s...\n", filePath)
 
+			// Grab the file from the hard drive
 			file, err := os.Open(filePath)
 			if err != nil {
 				fmt.Printf("Error opening file: %v\n", err)
 				os.Exit(1)
 			}
-			defer file.Close()
+			// This ensures the file gets closed when we are done, even if the program crashes
+			defer file.Close() 
 
-			// we are not using any io or os package here, because they loads the whole file here.
+			// bufio.Scanner is the secret sauce here. It reads the file in small chunks
+			// instead of loading the whole 10GB file into RAM at once.
 			scanner := bufio.NewScanner(file)
-
+			
 			totalLines := 0
 			matchCount := 0
 
+			// scanner.Scan() automatically looks for the Enter key (\n) 
+			// and stops at the end of each line.
 			for scanner.Scan() {
 				totalLines++
-				line := scanner.Text()
+				line := scanner.Text() 
 
-				if filterKeyword != "" || strings.Contains(line, filterKeyword) {
+				// We want the filter to be optional.
+				// If they didn't provide a filter (filterKeyword == ""), match everything.
+				// Otherwise, check if the line actually contains the keyword.
+				if filterKeyword == "" || strings.Contains(line, filterKeyword) {
 					matchCount++
-
+					
+					// Printing to the terminal is really slow. 
+					// We only print the first 5 so we don't lag the computer on massive files.
 					if matchCount <= 5 {
 						fmt.Println("->", line)
 					}
@@ -64,6 +74,7 @@ func main() {
 		},
 	}
 
+	// Tie the command line flags to our variables
 	rootCmd.Flags().StringVarP(&filePath, "file", "f", "", "Path to the log file (required)")
 	rootCmd.Flags().StringVarP(&filterKeyword, "filter", "k", "", "Keyword to filter logs by (optional)")
 
