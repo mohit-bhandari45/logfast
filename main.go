@@ -11,13 +11,15 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func worker(workerID int, jobs <-chan []byte, results chan<- int, filterKeyword []byte, wg *sync.WaitGroup) {
+func worker(workerID int, jobs <-chan []byte, results chan<- int, filterKeyword []byte, wg *sync.WaitGroup, pool *sync.Pool) {
 	defer wg.Done()
 
 	localMatchCount := 0
 
 	for chunk := range jobs {
 		// Keep slicing the chunk until there is no data left
+		originalArray := chunk;
+		
 		for len(chunk) > 0 {
 			// Find the location of the next line break
 			newlineIndex := bytes.IndexByte(chunk, '\n')
@@ -40,6 +42,7 @@ func worker(workerID int, jobs <-chan []byte, results chan<- int, filterKeyword 
 				localMatchCount++
 			}
 		}
+		pool.Put(originalArray[:cap(originalArray)])
 	}
 
 	results <- localMatchCount
@@ -75,6 +78,12 @@ func main() {
 			// Convert the string keyword to bytes once so workers don't have to
 			filterBytes := []byte(filterKeyword)
 
+			var chunkPool = sync.Pool{
+				New: func() interface{} {
+					return make([]byte, 64*1024)
+				},
+			}
+
 			// Update the jobs channel to hold blocks of raw bytes
 			jobs := make(chan []byte, 100)
 			results := make(chan int, numWorkers)
@@ -82,7 +91,7 @@ func main() {
 
 			for i := 0; i < numWorkers; i++ {
 				wg.Add(1)
-				go worker(i, jobs, results, filterBytes, &wg)
+				go worker(i, jobs, results, filterBytes, &wg, &chunkPool)
 			}
 
 			// Create a 64KB bucket to scoop data from the hard drive
@@ -104,7 +113,8 @@ func main() {
 					if lastNewline != -1 {
 						// Create a fresh, safe memory box for the clean lines
 						// We must make a copy so the next file read doesn't overwrite these bytes
-						sendChunk := make([]byte, lastNewline+1)
+						borrowedArray := chunkPool.Get().([]byte);
+						sendChunk := borrowedArray[:lastNewline+1]
 						copy(sendChunk, chunk[:lastNewline+1])
 						
 						// Ship the clean lines to the workers
