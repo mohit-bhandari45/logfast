@@ -47,11 +47,15 @@ BenchmarkStandardStrconv-12     27151347       41.13 ns/op       64 B/op        
 
 ```text
 pkg: logfast/pkg/ringbuffer
-BenchmarkRingBufferAdd-12      432644934        2.77 ns/op        0 B/op        0 allocs/op
+cpu: AMD Ryzen 5 5600H with Radeon Graphics
+
+BenchmarkOurRingBuffer-12           426090516         2.81 ns/op        0 B/op        0 allocs/op
+BenchmarkStandardDynamicSlice-12    100000000        10.35 ns/op       45 B/op        0 allocs/op
 ```
 
-- Inserts numbers into the circular buffer in **2.77 nanoseconds**.
-- Completely memory-neutral: wrapping around and overwriting older entries produces **0 B/op** and **0 allocs/op**.
+#### What this proves:
+- **Nearly 4x Faster Insertion:** `logfast` writes in **2.81 nanoseconds** vs 10.35 nanoseconds.
+- **Elimination of Dynamic Reallocation Overhead:** Using standard unbounded `append()` forces Go's runtime to constantly allocate memory (`45 B/op`) and copy array contents as the slice grows (`runtime.growslice`). Over 10 million lines, standard slicing wastes **450 MB of memory**, while our Ring Buffer strictly allocates **0 B/op**.
 
 ---
 
