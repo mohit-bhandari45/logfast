@@ -10,45 +10,27 @@ import (
 	"sync"
 
 	"github.com/spf13/cobra"
+
+	"logfast/pkg/parser"
+	"logfast/pkg/ringbuffer"
 )
 
-// WorkerResult bundles the match count and collected latency values from a worker
+// WorkerResult bundles the match count and collected latency values from a worker routine
 type WorkerResult struct {
 	matchCount int
 	latencies  []int
 }
 
-// parseLatency extracts numeric latency values directly from raw bytes with zero heap allocations
-func parseLatency(line []byte) (int, bool) {
-	key := []byte("latency=")
-	idx := bytes.Index(line, key)
-	if idx == -1 {
-		return 0, false
-	}
-
-	pos := idx + len(key)
-	val := 0
-	found := false
-
-	// Convert ASCII byte characters directly into integer digits using CPU register math
-	for pos < len(line) && line[pos] >= '0' && line[pos] <= '9' {
-		val = val*10 + int(line[pos]-'0')
-		pos++
-		found = true
-	}
-
-	return val, found
-}
-
-// worker runs concurrently across CPU cores, parsing byte chunks and aggregating statistics
+// worker runs concurrently across CPU cores, parsing byte chunks and collecting metrics in a local ring buffer
 func worker(workerID int, jobs <-chan []byte, results chan<- WorkerResult, filterKeyword []byte, wg *sync.WaitGroup, pool *sync.Pool) {
 	defer wg.Done()
 
 	localMatchCount := 0
-	var localLatencies []int
+	// Each worker maintains its own fixed-size ring buffer to prevent unbounded slice allocations
+	localRing := ringbuffer.New(10000)
 
 	for chunk := range jobs {
-		// Keep a pointer to the original borrowed slice so we can return it to the pool
+		// Retain reference to the original borrowed slice to safely return it to the sync.Pool
 		originalArray := chunk
 
 		for len(chunk) > 0 {
@@ -57,7 +39,7 @@ func worker(workerID int, jobs <-chan []byte, results chan<- WorkerResult, filte
 
 			var line []byte
 			if newlineIndex == -1 {
-				// The chunk has reached its end without an ending newline
+				// The chunk has reached its end without a trailing newline
 				line = chunk
 				chunk = nil
 			} else {
@@ -71,21 +53,21 @@ func worker(workerID int, jobs <-chan []byte, results chan<- WorkerResult, filte
 			if len(filterKeyword) == 0 || bytes.Contains(line, filterKeyword) {
 				localMatchCount++
 
-				// Extract the latency value from this line without string conversions
-				if lat, ok := parseLatency(line); ok {
-					localLatencies = append(localLatencies, lat)
+				// Extract latency values directly from the byte slice without string conversions
+				if lat, ok := parser.ParseLatency(line); ok {
+					localRing.Add(lat)
 				}
 			}
 		}
 
-		// Return the borrowed buffer to the sync.Pool to avoid garbage collection
+		// Return the borrowed buffer to the sync.Pool to eliminate garbage collection pauses
 		pool.Put(originalArray[:cap(originalArray)])
 	}
 
-	// Send local tallies and latencies back to the main thread
+	// Send local match tallies and sampled latency window back to the main thread
 	results <- WorkerResult{
 		matchCount: localMatchCount,
-		latencies:  localLatencies,
+		latencies:  localRing.Values(),
 	}
 }
 
@@ -116,7 +98,7 @@ func main() {
 			numWorkers := runtime.NumCPU()
 			fmt.Printf("Starting %d workers...\n", numWorkers)
 
-			// Convert filter to bytes once so workers do not perform string conversions
+			// Convert filter keyword to raw bytes once so workers do not perform string conversions
 			filterBytes := []byte(filterKeyword)
 
 			// Buffer pool to recycle 64KB arrays and prevent GC allocation pressure
@@ -192,25 +174,28 @@ func main() {
 				close(results)
 			}()
 
-			// Fan-In: aggregate counts and response times across all workers
+			// Fan-In: aggregate counts and feed latencies into a global fixed-size streaming window
+			globalRing := ringbuffer.New(100000)
 			totalMatches := 0
-			var allLatencies []int
 
 			for res := range results {
 				totalMatches += res.matchCount
-				allLatencies = append(allLatencies, res.latencies...)
+				for _, lat := range res.latencies {
+					globalRing.Add(lat)
+				}
 			}
 
 			fmt.Printf("\n--- Analysis Complete ---\n")
 			fmt.Printf("Total matches found: %d\n", totalMatches)
 
-			// Compute percentile metrics if response times were recorded
-			if len(allLatencies) > 0 {
-				sort.Ints(allLatencies)
+			// Compute percentile metrics over the streaming window
+			samples := globalRing.Values()
+			if len(samples) > 0 {
+				sort.Ints(samples)
 
-				p50 := allLatencies[len(allLatencies)*50/100]
-				p95 := allLatencies[len(allLatencies)*95/100]
-				p99 := allLatencies[len(allLatencies)*99/100]
+				p50 := samples[len(samples)*50/100]
+				p95 := samples[len(samples)*95/100]
+				p99 := samples[len(samples)*99/100]
 
 				fmt.Printf("Latency p50: %dms\n", p50)
 				fmt.Printf("Latency p95: %dms\n", p95)
