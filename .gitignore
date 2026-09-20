@@ -1,1 +1,6 @@
-*.txt
+# Binaries
+*.exe
+logfast
+
+# Large benchmark logs
+*.log

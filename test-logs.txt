@@ -1,0 +1,6 @@
+[INFO] user logged in latency=10
+[ERROR] connection timeout latency=450
+[INFO] database queried latency=25
+[ERROR] database disconnected latency=1200
+[INFO] user logged out latency=5
+[WARNING] CPU usage high latency=800

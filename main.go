@@ -61,7 +61,9 @@ func worker(workerID int, jobs <-chan []byte, results chan<- WorkerResult, filte
 		}
 
 		// Return the borrowed buffer to the sync.Pool to eliminate garbage collection pauses
-		pool.Put(originalArray[:cap(originalArray)])
+		if cap(originalArray) >= 128*1024 {
+			pool.Put(originalArray[:128*1024])
+		}
 	}
 
 	// Send local match tallies and sampled latency window back to the main thread
@@ -101,10 +103,10 @@ func main() {
 			// Convert filter keyword to raw bytes once so workers do not perform string conversions
 			filterBytes := []byte(filterKeyword)
 
-			// Buffer pool to recycle 64KB arrays and prevent GC allocation pressure
+			// Buffer pool to recycle 128KB arrays to accommodate 64KB reads plus any carried-over tail bytes
 			var chunkPool = sync.Pool{
 				New: func() interface{} {
-					return make([]byte, 64*1024)
+					return make([]byte, 128*1024)
 				},
 			}
 
@@ -137,7 +139,13 @@ func main() {
 					if lastNewline != -1 {
 						// Borrow a recycled buffer from the pool
 						borrowedArray := chunkPool.Get().([]byte)
-						sendChunk := borrowedArray[:lastNewline+1]
+						var sendChunk []byte
+						if lastNewline+1 > cap(borrowedArray) {
+							chunkPool.Put(borrowedArray)
+							sendChunk = make([]byte, lastNewline+1)
+						} else {
+							sendChunk = borrowedArray[:lastNewline+1]
+						}
 						copy(sendChunk, chunk[:lastNewline+1])
 
 						// Forward the complete lines chunk to the worker channel
