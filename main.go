@@ -6,46 +6,87 @@ import (
 	"io"
 	"os"
 	"runtime"
+	"sort"
 	"sync"
 
 	"github.com/spf13/cobra"
 )
 
-func worker(workerID int, jobs <-chan []byte, results chan<- int, filterKeyword []byte, wg *sync.WaitGroup, pool *sync.Pool) {
+// WorkerResult bundles the match count and collected latency values from a worker
+type WorkerResult struct {
+	matchCount int
+	latencies  []int
+}
+
+// parseLatency extracts numeric latency values directly from raw bytes with zero heap allocations
+func parseLatency(line []byte) (int, bool) {
+	key := []byte("latency=")
+	idx := bytes.Index(line, key)
+	if idx == -1 {
+		return 0, false
+	}
+
+	pos := idx + len(key)
+	val := 0
+	found := false
+
+	// Convert ASCII byte characters directly into integer digits using CPU register math
+	for pos < len(line) && line[pos] >= '0' && line[pos] <= '9' {
+		val = val*10 + int(line[pos]-'0')
+		pos++
+		found = true
+	}
+
+	return val, found
+}
+
+// worker runs concurrently across CPU cores, parsing byte chunks and aggregating statistics
+func worker(workerID int, jobs <-chan []byte, results chan<- WorkerResult, filterKeyword []byte, wg *sync.WaitGroup, pool *sync.Pool) {
 	defer wg.Done()
 
 	localMatchCount := 0
+	var localLatencies []int
 
 	for chunk := range jobs {
-		// Keep slicing the chunk until there is no data left
-		originalArray := chunk;
-		
+		// Keep a pointer to the original borrowed slice so we can return it to the pool
+		originalArray := chunk
+
 		for len(chunk) > 0 {
-			// Find the location of the next line break
+			// Locate line breaks inside the raw byte chunk
 			newlineIndex := bytes.IndexByte(chunk, '\n')
-			
+
 			var line []byte
 			if newlineIndex == -1 {
-				// No line break means this is the very last piece of text in the chunk
+				// The chunk has reached its end without an ending newline
 				line = chunk
-				// Empty the chunk to stop the loop
 				chunk = nil
 			} else {
 				// Slice out the exact line using zero-copy memory pointers
 				line = chunk[:newlineIndex]
-				// Shrink the remaining chunk by moving past the line break we just found
+				// Advance the remaining chunk forward past the newline
 				chunk = chunk[newlineIndex+1:]
 			}
 
-			// Check if the line contains our keyword directly in the raw bytes
+			// Match lines against the optional filter keyword
 			if len(filterKeyword) == 0 || bytes.Contains(line, filterKeyword) {
 				localMatchCount++
+
+				// Extract the latency value from this line without string conversions
+				if lat, ok := parseLatency(line); ok {
+					localLatencies = append(localLatencies, lat)
+				}
 			}
 		}
+
+		// Return the borrowed buffer to the sync.Pool to avoid garbage collection
 		pool.Put(originalArray[:cap(originalArray)])
 	}
 
-	results <- localMatchCount
+	// Send local tallies and latencies back to the main thread
+	results <- WorkerResult{
+		matchCount: localMatchCount,
+		latencies:  localLatencies,
+	}
 }
 
 func main() {
@@ -75,66 +116,65 @@ func main() {
 			numWorkers := runtime.NumCPU()
 			fmt.Printf("Starting %d workers...\n", numWorkers)
 
-			// Convert the string keyword to bytes once so workers don't have to
+			// Convert filter to bytes once so workers do not perform string conversions
 			filterBytes := []byte(filterKeyword)
 
+			// Buffer pool to recycle 64KB arrays and prevent GC allocation pressure
 			var chunkPool = sync.Pool{
 				New: func() interface{} {
 					return make([]byte, 64*1024)
 				},
 			}
 
-			// Update the jobs channel to hold blocks of raw bytes
+			// Channels for distributing chunks and gathering worker results
 			jobs := make(chan []byte, 100)
-			results := make(chan int, numWorkers)
+			results := make(chan WorkerResult, numWorkers)
 			var wg sync.WaitGroup
 
+			// Fan-Out: start worker routines across CPU cores
 			for i := 0; i < numWorkers; i++ {
 				wg.Add(1)
 				go worker(i, jobs, results, filterBytes, &wg, &chunkPool)
 			}
 
-			// Create a 64KB bucket to scoop data from the hard drive
+			// A reusable buffer to stream chunks from disk
 			buf := make([]byte, 64*1024)
-			// This cup holds words that get accidentally chopped in half
 			var tail []byte
 
 			for {
-				// Scoop up to 64KB of data from the file
+				// Read a 64KB block from the file
 				n, err := file.Read(buf)
-				
+
 				if n > 0 {
-					// Glue the chopped word from the previous scoop to the front of this new scoop
+					// Prepend leftover bytes from the previous block to keep lines intact
 					chunk := append(tail, buf[:n]...)
 
-					// Scan backwards to find the last clean line break
+					// Look backwards for the last complete newline character
 					lastNewline := bytes.LastIndexByte(chunk, '\n')
-					
+
 					if lastNewline != -1 {
-						// Create a fresh, safe memory box for the clean lines
-						// We must make a copy so the next file read doesn't overwrite these bytes
-						borrowedArray := chunkPool.Get().([]byte);
+						// Borrow a recycled buffer from the pool
+						borrowedArray := chunkPool.Get().([]byte)
 						sendChunk := borrowedArray[:lastNewline+1]
 						copy(sendChunk, chunk[:lastNewline+1])
-						
-						// Ship the clean lines to the workers
+
+						// Forward the complete lines chunk to the worker channel
 						jobs <- sendChunk
-						
-						// Save the remaining chopped-off word into the tail cup for the next loop
+
+						// Retain leftover sliced text for the next read cycle
 						tail = chunk[lastNewline+1:]
 					} else {
-						// The entire chunk had no line breaks, so it's all one giant tail
+						// No line breaks present in this block; carry all bytes over
 						tail = chunk
 					}
 				}
 
-				// Check if we hit the bottom of the file
+				// Check for end of file
 				if err == io.EOF {
-					// If there is any leftover chopped text, send it to the workers
+					// Forward any final remaining bytes in the tail to the workers
 					if len(tail) > 0 {
 						jobs <- tail
 					}
-					// Exit the infinite loop
 					break
 				}
 				if err != nil {
@@ -143,21 +183,39 @@ func main() {
 				}
 			}
 
-			// Put up the closed sign on the jobs channel
+			// Signal workers that all chunks have been dispatched
 			close(jobs)
 
+			// Monitor workers and close results channel upon full completion
 			go func() {
 				wg.Wait()
 				close(results)
 			}()
 
+			// Fan-In: aggregate counts and response times across all workers
 			totalMatches := 0
-			for count := range results {
-				totalMatches += count
+			var allLatencies []int
+
+			for res := range results {
+				totalMatches += res.matchCount
+				allLatencies = append(allLatencies, res.latencies...)
 			}
 
 			fmt.Printf("\n--- Analysis Complete ---\n")
 			fmt.Printf("Total matches found: %d\n", totalMatches)
+
+			// Compute percentile metrics if response times were recorded
+			if len(allLatencies) > 0 {
+				sort.Ints(allLatencies)
+
+				p50 := allLatencies[len(allLatencies)*50/100]
+				p95 := allLatencies[len(allLatencies)*95/100]
+				p99 := allLatencies[len(allLatencies)*99/100]
+
+				fmt.Printf("Latency p50: %dms\n", p50)
+				fmt.Printf("Latency p95: %dms\n", p95)
+				fmt.Printf("Latency p99: %dms\n", p99)
+			}
 		},
 	}
 
